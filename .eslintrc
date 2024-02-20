@@ -1,0 +1,11 @@
+/* If you're using eslint you can catch problematic imports with the no-restricted-imports rule. The following .eslintrc configuration will highlight problematic imports from @mui packages*/
+{
+  "rules": {
+    "no-restricted-imports": [
+      "error",
+      {
+        "patterns": ["@mui/*/*/*"]
+      }
+    ]
+  }
+}

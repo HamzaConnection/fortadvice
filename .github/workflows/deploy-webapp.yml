@@ -1,0 +1,226 @@
+name: build-deploy-webapp
+
+on:
+  push:
+    branches:
+      - master
+      - deploy/test
+      - deploy/demo
+      - deploy/qa
+      - deploy/prod
+  pull_request:
+
+jobs:
+  detect-env:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Detect environment [test]
+        if: github.ref == 'refs/heads/deploy/test'
+        run: |
+          echo "TARGET_ENV=test" >> $GITHUB_ENV
+      - name: Detect environment [demo]
+        if: github.ref == 'refs/heads/deploy/demo'
+        run: |
+          echo "TARGET_ENV=demo" >> $GITHUB_ENV
+      - name: Detect environment [qa]
+        if: github.ref == 'refs/heads/deploy/qa'
+        run: |
+          echo "TARGET_ENV=qa" >> $GITHUB_ENV
+      - name: Detect environment [prod]
+        if: github.ref == 'refs/heads/deploy/prod'
+        run: |
+          echo "TARGET_ENV=prod" >> $GITHUB_ENV
+      - name: Calculate environment settings
+        run: |
+          echo "DEPLOY=${{ startsWith(github.ref, 'refs/heads/deploy') }}" >> $GITHUB_ENV
+          echo "APP_URL=https://$TARGET_ENV.facilitynet.dk/gopay-manager" >> $GITHUB_ENV
+          echo "API_ENDPOINT=https://$TARGET_ENV.facilitynet.dk/api" >> $GITHUB_ENV
+          echo "DEPLOY_PATH=/var/www/$TARGET_ENV/gopay-manager" >> $GITHUB_ENV
+          echo "DEPLOY_TIME=$(date -u +%Y-%m-%dT%TZ)" >> $GITHUB_ENV
+      - name: Show environment
+        id: show-environment
+        run: |
+          echo "Deploy?: $DEPLOY"
+          echo "Target environment: $TARGET_ENV"
+          echo "App URL: $APP_URL"
+          echo "API endpoint: $API_ENDPOINT"
+          echo "Deploy path: $DEPLOY_PATH"
+          echo "Deploy time: $DEPLOY_TIME"
+    outputs:
+      deploy: ${{ env.DEPLOY }}
+      target_env: ${{ env.TARGET_ENV }}
+      app_url: ${{ env.APP_URL }}
+      api_endpoint: ${{ env.API_ENDPOINT }}
+      deploy_path: ${{ env.DEPLOY_PATH }}
+      deploy_time: ${{ env.DEPLOY_TIME }}
+
+  build:
+    runs-on: ubuntu-latest
+    needs: detect-env
+    env:
+      DEPLOY: ${{ needs.detect-env.outputs.deploy }}
+      DEPLOY_PATH: ${{ needs.detect-env.outputs.deploy_path }}
+      DEPLOY_TIME: ${{ needs.detect-env.outputs.deploy_time }}
+      TARGET_ENV: ${{ needs.detect-env.outputs.target_env }}
+      APP_URL: ${{ needs.detect-env.outputs.app_url }}
+      API_ENDPOINT: ${{ needs.detect-env.outputs.api_endpoint }}
+
+    steps:
+      # Needed for project.sh
+      - name: Install project.sh dependencies
+        run: |
+          sudo apt update
+          sudo apt -yq --no-install-suggests --no-install-recommends install inkscape imagemagick
+
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0 # needed for set-version to work
+
+      - name: Initialize project
+        run: ./project.sh --init
+
+      - uses: FacilityNet/set-version@v1
+        id: set_version
+        with:
+          eventName: ${{ github.event_name }}
+          event: ${{ toJSON(github.event) }}
+
+      - name: set-version-env
+        run: |
+          echo "APP_VERSION=${{ steps.set_version.outputs.fullNoMeta }}" >> $GITHUB_ENV
+          echo "APP_VERSION_FULL=${{ steps.set_version.outputs.full }}" >> $GITHUB_ENV
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+
+      - name: Setup .npmrc
+        run: >-  # see: https://yaml-multiline.info/
+          echo -e "@fortawesome:registry=https://npm.fontawesome.com/\n
+          //npm.fontawesome.com/:_authToken=${{ secrets.FONTAWESOME_TOKEN }}"
+          >> ~/.npmrc
+
+      - name: Setup environment info and API endpoint
+        run: |
+          echo "REACT_APP_TARGET_ENV=$TARGET_ENV" >> .env
+          echo "REACT_APP_URL=$APP_URL" >> .env
+          echo "REACT_APP_VERSION=$APP_VERSION" >> .env
+          echo "REACT_APP_VERSION_FULL=$APP_VERSION_FULL" >> .env
+          echo "REACT_APP_API_ENDPOINT=$API_ENDPOINT" >> .env
+          echo "REACT_APP_DEPLOY_PATH=$DEPLOY_PATH" >> .env
+          echo "REACT_APP_DEPLOY_TIME=$DEPLOY_TIME" >> .env
+
+      - name: Setup secrets
+        run: |
+          echo "REACT_APP_INTERCOM_APPID=${{ secrets.INTERCOM_APP_ID }}" >> .env
+
+      - name: Installing dependencies
+        run: npm install
+
+      - name: Building project
+        run: npm run build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        if: env.DEPLOY == 'true'
+        with:
+          name: automatic-build
+          path: build/
+          retention-days: 1
+          if-no-files-found: error
+
+  create-gh-deployment:
+    runs-on: ubuntu-latest
+    needs: [detect-env, build]
+    if: needs.detect-env.outputs.deploy == 'true'
+    env:
+      TARGET_ENV: ${{ needs.detect-env.outputs.target_env }}
+    steps:
+      - name: Create deployment
+        id: create_deployment
+        uses: octokit/request-action@v2.x
+        with:
+          route: POST /repos/:repository/deployments
+          repository: ${{ github.repository }}
+          ref: ${{ github.ref }}
+          required_contexts: '[]'
+          environment: ${{ env.TARGET_ENV }}
+          auto_merge: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      deployment_id: ${{ fromJson(steps.create_deployment.outputs.data).id }}
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [detect-env, build, create-gh-deployment]
+    if: needs.detect-env.outputs.deploy == 'true'
+    env:
+      TARGET_ENV: ${{ needs.detect-env.outputs.target_env }}
+      APP_URL: ${{ needs.detect-env.outputs.app_url }}
+      DEPLOY_PATH: ${{ needs.detect-env.outputs.deploy_path }}
+      DEPLOYMENT_ID: ${{ needs.create-gh-deployment.outputs.deployment_id }}
+    steps:
+      - name: Set deployment status to "in progress"
+        uses: octokit/request-action@v2.x
+        with:
+          route: POST /repos/:repository/deployments/:deployment/statuses
+          repository: ${{ github.repository }}
+          deployment: ${{ env.DEPLOYMENT_ID }}
+          environment: ${{ env.TARGET_ENV }}
+          environment_url: ${{ env.APP_URL }}
+          log_url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          mediaType: '{"previews": ["flash", "ant-man"]}'
+          state: in_progress
+          description: "Deploying..."
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: automatic-build
+          path: build/
+
+      - name: Create .ssh if not exists
+        run: mkdir -p ~/.ssh && chmod 700 ~/.ssh
+
+      - name: Add appserver.facilitynet.dk to known hosts
+        run: echo "${{ secrets.DEPLOY_HOSTKEY }}" >> ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts
+
+      - name: Add deploy SSH key
+        run: echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+
+      - name: Deploy
+        run: rsync --recursive --links --checksum --compress --verbose build/ githubbot@appserver.facilitynet.dk:${{ env.DEPLOY_PATH }}
+
+      - name: Set deployment status to success
+        uses: octokit/request-action@v2.x
+        if: success()
+        with:
+          route: POST /repos/:repository/deployments/:deployment/statuses
+          repository: ${{ github.repository }}
+          deployment: ${{ env.DEPLOYMENT_ID }}
+          environment: ${{ env.TARGET_ENV }}
+          environment_url: ${{ env.APP_URL }}
+          log_url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          mediaType: '{"previews": ["flash", "ant-man"]}'
+          state: success
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Set deployment status to failure
+        uses: octokit/request-action@v2.x
+        if: failure()
+        with:
+          route: POST /repos/:repository/deployments/:deployment/statuses
+          repository: ${{ github.repository }}
+          deployment: ${{ env.DEPLOYMENT_ID }}
+          environment: ${{ env.TARGET_ENV }}
+          environment_url: ${{ env.APP_URL }}
+          log_url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          mediaType: '{"previews": ["flash", "ant-man"]}'
+          state: failure
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
